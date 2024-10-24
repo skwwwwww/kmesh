@@ -1,17 +1,17 @@
 /*
-* Copyright The Kmesh Authors.
-*
-* Licensed under the Apache License, Version 2.0 (the "License");
-* you may not use this file except in compliance with the License.
-* You may obtain a copy of the License at:
-*
-*     http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing, software
-* distributed under the License is distributed on an "AS IS" BASIS,
-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
-* limitations under the License.
+ * Copyright The Kmesh Authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at:
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package telemetry
@@ -26,7 +26,7 @@ import (
 )
 
 const (
-	mapMetricFlushInterval = 5 * time.Second
+	mapMetricFlushInterval = 20 * time.Second
 )
 
 type MapMetricController struct {
@@ -40,12 +40,12 @@ type mapUsageMetric struct {
 	maxEntries uint32
 	keySize    uint32
 	valueSize  uint32
-	memLock    uint32
+	memLock    uint64
 	entryCount uint32
 }
 
 type mapUsageInfo struct {
-	memLock    uint32
+	memLock    uint64
 	entryCount uint32
 	maxEntries uint32
 }
@@ -105,65 +105,92 @@ func (m *MapMetricController) buildMapMetric(data *mapUsageMetric) mapMetricLabe
 
 func (m *MapMetricController) updatePrometheusMetric() {
 	var startID ebpf.MapID
-	var commonLabels map[string]string
-	var entryCount uint32
 	count := 0
 	currentMapIDs := make(map[string]bool)
+	var commonLabels map[string]string
+
 	for {
-		mapData := mapUsageMetric{}
-		// get next map ID
-		mapID, err := ebpf.MapGetNextID(startID)
+		mapID, mapInfo, info, err := getNextMapInfo(startID)
 		if err != nil {
 			break
 		}
-		// get map info by map ID
-		mapInfo, err := ebpf.NewMapFromID(mapID)
-		if err != nil {
-			log.Infof("Failed to open map ID %d: %v", mapID, err)
-			startID = mapID
-			continue
-		}
 		defer mapInfo.Close()
-		info, err := mapInfo.Info()
-		if err != nil {
-			log.Infof("Failed to get map info for ID %d: %v", mapID, err)
-			startID = mapID
-			continue
-		}
-		memLock := (info.KeySize + info.ValueSize) * info.MaxEntries
-		if memLock%4096 != 0 {
-			memLock = ((memLock / 4096) + 1) * 4096
-		}
-		if err != nil {
-			log.Infof("Failed to get entry count for map ID %d: %v", mapID, err)
-		}
+		memLock := calculateMemLock(info)
+		entryCount := uint32(0)
 		if info.Type != ebpf.RingBuf {
 			entryCount, _ = getMapEntryCountFallback(mapInfo)
-		} else {
-			entryCount = 0
 		}
+		mapData := buildMapUsageMetric(mapID, info, memLock, entryCount)
+		metricLabels := m.buildMapMetric(&mapData)
+		updatePrometheusMetricsForMap(m, metricLabels, mapData, entryCount, memLock)
+		currentMapIDs[metricLabels.mapId] = true
 		startID = mapID
 		count++
-		mapData.mapId = uint32(mapID)
-		mapData.mapName = info.Name
-		mapData.mapType = type2String(info.Type)
-		mapData.maxEntries = info.MaxEntries
-		mapData.keySize = info.KeySize
-		mapData.valueSize = info.ValueSize
-		mapData.memLock = memLock
-		mapData.entryCount = entryCount
-		metricLabels := m.buildMapMetric(&mapData)
-		mapUsageInfo := mapUsageInfo{}
-		mapUsageInfo.entryCount = entryCount
-		mapUsageInfo.memLock = memLock
-		mapUsageInfo.maxEntries = info.MaxEntries
-		commonLabels = struct2map(metricLabels)
-		currentMapIDs[metricLabels.mapId] = true
-		m.mapMetricCache[metricLabels] = &mapUsageInfo
-		mapUsage.With(commonLabels).Set(float64(entryCount))
-		mapMemory.With(commonLabels).Set(float64(memLock))
-		mapMaxEntries.With(commonLabels).Set(float64(info.MaxEntries))
 	}
+	deleteObsoleteMetrics(m, currentMapIDs)
+	mapCountInPod.With(map[string]string{
+		"pod_name":      commonLabels["pod_name"],
+		"pod_namespace": commonLabels["pod_namespace"],
+	}).Set(float64(count))
+}
+
+func getNextMapInfo(startID ebpf.MapID) (ebpf.MapID, *ebpf.Map, *ebpf.MapInfo, error) {
+	mapID, err := ebpf.MapGetNextID(startID)
+	if err != nil {
+		return 0, nil, nil, err
+	}
+
+	mapInfo, err := ebpf.NewMapFromID(mapID)
+	if err != nil {
+		log.Infof("Failed to open map ID %d: %v", mapID, err)
+		return mapID, nil, nil, err
+	}
+
+	info, err := mapInfo.Info()
+	if err != nil {
+		log.Infof("Failed to get map info for ID %d: %v", mapID, err)
+		return mapID, mapInfo, nil, err
+	}
+
+	return mapID, mapInfo, info, nil
+}
+
+func calculateMemLock(info *ebpf.MapInfo) uint64 {
+	memLock := uint64(info.KeySize+info.ValueSize) * uint64(info.MaxEntries)
+	if memLock%4096 != 0 {
+		memLock = ((memLock / 4096) + 1) * 4096
+	}
+	return memLock
+}
+
+func buildMapUsageMetric(mapID ebpf.MapID, info *ebpf.MapInfo, memLock uint64, entryCount uint32) mapUsageMetric {
+	return mapUsageMetric{
+		mapId:      uint32(mapID),
+		mapName:    info.Name,
+		mapType:    type2String(info.Type),
+		maxEntries: info.MaxEntries,
+		keySize:    info.KeySize,
+		valueSize:  info.ValueSize,
+		memLock:    memLock,
+		entryCount: entryCount,
+	}
+}
+
+func updatePrometheusMetricsForMap(m *MapMetricController, metricLabels mapMetricLabels, mapData mapUsageMetric, entryCount uint32, memLock uint64) {
+	mapUsageInfo := mapUsageInfo{
+		entryCount: entryCount,
+		memLock:    memLock,
+		maxEntries: mapData.maxEntries,
+	}
+
+	commonLabels := struct2map(metricLabels)
+	m.mapMetricCache[metricLabels] = &mapUsageInfo
+	mapUsage.With(commonLabels).Set(float64(entryCount))
+	mapMemory.With(commonLabels).Set(float64(memLock))
+	mapMaxEntries.With(commonLabels).Set(float64(mapData.maxEntries))
+}
+
+func deleteObsoleteMetrics(m *MapMetricController, currentMapIDs map[string]bool) {
 	for labels := range m.mapMetricCache {
 		if _, exists := currentMapIDs[labels.mapId]; !exists {
 			delete(m.mapMetricCache, labels)
@@ -173,10 +200,6 @@ func (m *MapMetricController) updatePrometheusMetric() {
 			mapMaxEntries.Delete(commonLabels)
 		}
 	}
-	mapCountInPod.With(map[string]string{
-		"pod_name":      commonLabels["pod_name"],
-		"pod_namespace": commonLabels["pod_namespace"],
-	}).Set(float64(count))
 }
 func getMapEntryCountFallback(m *ebpf.Map) (uint32, error) {
 	var entryCount uint32
